@@ -1,0 +1,13 @@
+# Upstream llama.cpp checkout + build artifacts.
+# Reproducible: start.sh pins the exact commit via LLAMA_CPP_REF and
+# `./start.sh --rebuild` recreates it from scratch.
+/llama.cpp/
+
+# Model cache (multi-GB GGUF downloads, re-fetched from Hugging Face).
+/unsloth/
+
+# Python virtualenv (recreated by start.sh from requirements.txt).
+/.venv/
+
+# Runtime logs, guard state and ready flags.
+/logs/

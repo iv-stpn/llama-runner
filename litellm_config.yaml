@@ -1,0 +1,10 @@
+model_list:
+  - model_name: local
+    litellm_params:
+      model: openai/local
+      api_base: http://localhost:8080/v1
+      api_key: dummy
+
+general_settings:
+  master_key: dummy
+  drop_params: true   # ignore unsupported Anthropic params instead of erroring
