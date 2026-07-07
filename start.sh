@@ -33,6 +33,16 @@ RUNTIME_MIN_FREE_GB="${RUNTIME_MIN_FREE_GB:-2}"
 RUNTIME_LOW_STREAK_LIMIT="${RUNTIME_LOW_STREAK_LIMIT:-5}"
 RUNTIME_WRITEBACK_WARN_MB="${RUNTIME_WRITEBACK_WARN_MB:-512}"
 
+# Graceful-shutdown budget before SIGKILL. The original 90s hang was --no-mmap
+# (kept — mmap+-cmoe crashes inference, see launch args) TOGETHER with the
+# auto-loaded BF16 vision projector: freeing that projector through WSL2's GPU
+# passthrough is what stalled teardown. With --no-mmproj the projector is gone
+# and teardown now completes on its own in ~4s (measured 2026-07-06), never
+# reaching this cap. So this is a safety net, not the fix: if some future change
+# re-wedges teardown, force-kill after 20s instead of the old 90s of dead time
+# (SIGKILL freed the GPU cleanly every time it hit today).
+LLAMA_SHUTDOWN_GRACE_SEC="${LLAMA_SHUTDOWN_GRACE_SEC:-20}"
+
 # Extra stability guards for long WSL runs.
 # The low-VRAM guard arms only after the server passes its health check and
 # uses the steady-state free VRAM at that moment as its baseline: on small
@@ -347,10 +357,9 @@ configure_runtime_safety
 
 LLAMA_ARGS=(
     -hf "$MODEL_REPO:$MODEL_FILE"
-    -cmoe -c "$LLAMA_CTX" -fa "$LLAMA_FA_MODE" -np 1 --no-mmap
+    --no-mmproj -cmoe -c "$LLAMA_CTX" -fa "$LLAMA_FA_MODE" -np 1 --no-mmap
     -b "$LLAMA_BATCH_SIZE" -ub "$LLAMA_UBATCH_SIZE"
     --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.00
-    --image-min-tokens 1024
     --host 0.0.0.0 --port "$LLAMA_PORT"
 )
 
@@ -412,11 +421,11 @@ cleanup() {
         if [ $((waited % 10)) -eq 0 ]; then
             echo "==> Still shutting down (${waited}s)... this is normal, no need to press Ctrl+C again."
         fi
-        if [ "$waited" -ge 90 ]; then
-            echo "==> llama-server did not exit after 90s — forcing termination."
+        if [ "$waited" -ge "$LLAMA_SHUTDOWN_GRACE_SEC" ]; then
+            echo "==> llama-server did not exit after ${LLAMA_SHUTDOWN_GRACE_SEC}s — forcing termination."
             echo "==> If the next run hangs while loading the model, this can leave WSL2's GPU passthrough wedged;"
             echo "==> run 'wsl.exe --shutdown' from PowerShell (not a full reboot) and try again."
-            log_guard "cleanup_force_kill waited_s=90 pid=$target"
+            log_guard "cleanup_force_kill waited_s=$LLAMA_SHUTDOWN_GRACE_SEC pid=$target"
             kill -9 "$target" 2>/dev/null || true
             break
         fi
