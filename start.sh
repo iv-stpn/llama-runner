@@ -78,6 +78,14 @@ GUARD_STATE_FILE="${GUARD_STATE_FILE:-$SCRIPT_DIR/logs/llama_guard.state}"
 # llama-server output is captured here (rotated to .prev each run) so CUDA
 # errors survive the terminal scrollback and abrupt session ends.
 LLAMA_LOG_FILE="${LLAMA_LOG_FILE:-$SCRIPT_DIR/logs/llama_server.log}"
+# Mirror that captured log to the console so the live per-task tok/s and
+# slot-processing lines (llama-server's verbose output) show up in the terminal
+# again, not just in the file. On by default; set 0 for a quiet console (the
+# file is still written either way). This is a decoupled `tail -f` reader, NOT
+# a pipe on llama-server's stdout: piping (tee) would let a Ctrl+C on the reader
+# push SIGPIPE into llama-server mid-CUDA-teardown — the exact GPU-wedge the
+# setsid isolation below exists to prevent.
+LLAMA_LOG_TO_CONSOLE="${LLAMA_LOG_TO_CONSOLE:-1}"
 # The watchdog runs in a subshell: its variable assignments never reach the
 # cleanup trap in the main script, so stop reasons are handed over via file.
 GUARD_REASON_FILE="${GUARD_REASON_FILE:-$SCRIPT_DIR/logs/llama_guard.reason}"
@@ -397,6 +405,18 @@ setsid "$LLAMA_DIR/llama-server" "${LLAMA_ARGS[@]}" >"$LLAMA_LOG_FILE" 2>&1 &
 LLAMA_PID=""
 MONITOR_PID=""
 LITELLM_PID=""
+LOGTAIL_PID=""
+
+# Mirror the captured log to this terminal (see LLAMA_LOG_TO_CONSOLE above).
+# -F (not -f) so it tolerates the .prev rotation and the file not existing yet;
+# -n 0 starts from the launch we just kicked off (no stale replay). cleanup()
+# kills it on exit so it can't outlive the server. It only reads the file, so a
+# Ctrl+C on this tail can never reach llama-server's stdout.
+if [ "$LLAMA_LOG_TO_CONSOLE" = "1" ]; then
+    echo "==> Mirroring llama-server log to this console (set LLAMA_LOG_TO_CONSOLE=0 to disable)."
+    tail -n 0 -F "$LLAMA_LOG_FILE" 2>/dev/null &
+    LOGTAIL_PID="$!"
+fi
 
 cleanup() {
     # Run only once even though EXIT/INT/TERM can all fire this trap.
@@ -411,6 +431,9 @@ cleanup() {
     write_guard_state
     if [ -n "$MONITOR_PID" ] && kill -0 "$MONITOR_PID" 2>/dev/null; then
         kill "$MONITOR_PID" 2>/dev/null || true
+    fi
+    if [ -n "$LOGTAIL_PID" ] && kill -0 "$LOGTAIL_PID" 2>/dev/null; then
+        kill "$LOGTAIL_PID" 2>/dev/null || true
     fi
     if [ -n "$LITELLM_PID" ] && kill -0 "$LITELLM_PID" 2>/dev/null; then
         kill "$LITELLM_PID" 2>/dev/null || true
