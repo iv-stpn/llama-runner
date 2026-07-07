@@ -52,15 +52,22 @@ RUNTIME_MAX_GPU_TEMP_C="${RUNTIME_MAX_GPU_TEMP_C:-86}"
 RUNTIME_GPU_MIN_FREE_MB="${RUNTIME_GPU_MIN_FREE_MB:-512}"
 RUNTIME_GPU_LOW_STREAK_LIMIT="${RUNTIME_GPU_LOW_STREAK_LIMIT:-4}"
 
-# Conservative serving defaults to avoid transient memory spikes during long-context decoding.
+# Conservative serving defaults to avoid transient memory spikes during
+# long-context decoding. At/above the WSL threshold below these get clamped
+# further; override via env if you want to experiment at small context.
 LLAMA_BATCH_SIZE="${LLAMA_BATCH_SIZE:-256}"
 LLAMA_UBATCH_SIZE="${LLAMA_UBATCH_SIZE:-64}"
 # MTP speculative decoding is off by default: the draft-mtp path hits CUDA
 # illegal memory access under multi-turn agentic load (llama.cpp #23210).
 # Set LLAMA_SPEC_DRAFT_N_MAX=1 to re-enable once fixed upstream.
 LLAMA_SPEC_DRAFT_N_MAX="${LLAMA_SPEC_DRAFT_N_MAX:-0}"
-# Must sit below 64000: choose_safe_ctx halves from 256000 and lands on
-# 64000, never 65536, so a 65536 threshold silently skips WSL safety mode.
+# At/above this context on WSL, "WSL safety mode" (see configure_runtime_safety)
+# turns Flash Attention OFF, disables the draft path, and clamps the batch.
+# This is load-bearing, NOT theoretical: with FA ON at ctx=64000 this rig
+# reproduced the CUDA illegal-memory-access crash (2026-07-06, draft-mtp already
+# off), and a crashed backend looks exactly like an indefinite hang to the
+# client. Must sit below 64000: choose_safe_ctx halves from 256000 and lands on
+# 64000, never 65536, so a 65536 threshold would silently skip safety mode.
 LLAMA_DISABLE_FA_CTX_THRESHOLD="${LLAMA_DISABLE_FA_CTX_THRESHOLD:-49152}"
 
 # Persistent telemetry for post-mortem debugging after abrupt crashes/reboots.
@@ -309,18 +316,24 @@ is_wsl() {
 }
 
 configure_runtime_safety() {
-    # Start from user-provided defaults.
+    # Base defaults for small-context / non-WSL use, where FA is a clear win.
     LLAMA_FA_MODE="on"
     LLAMA_SPEC_ENABLED=1
 
-    # On WSL + very large context, flash-attention and aggressive speculative
-    # settings can push GPU/driver stability over the edge on some systems.
+    # WSL safety mode. On WSL at large context this rig hits a CUDA illegal
+    # memory access; FA-ON at ctx=64000 REPRODUCED it on 2026-07-06 with the
+    # draft-mtp path already disabled, so FA itself — not just draft-mtp — is
+    # implicated here. A crashed backend is indistinguishable from an indefinite
+    # hang at the client (LiteLLM just waits on the dead socket), so this guard
+    # is the real fix for the "hangs forever" symptom, not a mere perf knob.
+    # Turn FA off, disable the draft path, and clamp batch/ubatch for headroom.
     if is_wsl && [ "$LLAMA_CTX" -ge "$LLAMA_DISABLE_FA_CTX_THRESHOLD" ]; then
         LLAMA_FA_MODE="off"
         LLAMA_SPEC_DRAFT_N_MAX=0
         LLAMA_SPEC_ENABLED=0
 
-        # Also trim transient KV/compute spikes for extra headroom.
+        # Without FA the attention buffer scales with context, so keep the
+        # batch small to avoid transient VRAM spikes on the 8GB card.
         if [ "$LLAMA_BATCH_SIZE" -gt 192 ]; then
             LLAMA_BATCH_SIZE=192
         fi
@@ -330,7 +343,7 @@ configure_runtime_safety() {
 
         echo "==> WSL safety mode: large context detected (ctx=$LLAMA_CTX)."
         echo "==> Applying conservative runtime flags: -fa off, no speculative draft, reduced batch/ubatch."
-        log_guard "wsl_safety_mode enabled ctx=$LLAMA_CTX batch=$LLAMA_BATCH_SIZE ubatch=$LLAMA_UBATCH_SIZE"
+        log_guard "wsl_safety_mode enabled ctx=$LLAMA_CTX fa=$LLAMA_FA_MODE batch=$LLAMA_BATCH_SIZE ubatch=$LLAMA_UBATCH_SIZE"
     fi
 }
 
