@@ -42,6 +42,20 @@ RUNTIME_WRITEBACK_WARN_MB="${RUNTIME_WRITEBACK_WARN_MB:-512}"
 # re-wedges teardown, force-kill after 20s instead of the old 90s of dead time
 # (SIGKILL freed the GPU cleanly every time it hit today).
 LLAMA_SHUTDOWN_GRACE_SEC="${LLAMA_SHUTDOWN_GRACE_SEC:-20}"
+# Under MEMORY PRESSURE a graceful SIGTERM is actively harmful: llama-server's
+# exit handler (the "cleaning up before exit..." line) walks 25GB of resident
+# weights to free them, and doing that while the box is already near-OOM thrashes
+# swap so hard the teardown appears to hang — which is exactly the reported
+# symptom. So the memory-pressure guard uses a much shorter grace before SIGKILL:
+# reclaiming the pages wholesale (what SIGKILL does) is what actually relieves the
+# pressure. Empirically SIGKILL has freed the GPU cleanly on this rig every time.
+LLAMA_GUARD_KILL_GRACE_SEC="${LLAMA_GUARD_KILL_GRACE_SEC:-3}"
+# After SIGKILL, how long to wait for the kernel to actually reap the process
+# before declaring it unreapable. A process wedged in an uninterruptible GPU
+# ioctl (WSL2 /dev/dxg) can't be reaped even by SIGKILL until that syscall
+# returns; past this window we stop waiting and tell the operator to run
+# `wsl.exe --shutdown` rather than polling a zombie forever.
+LLAMA_SIGKILL_REAP_WAIT_SEC="${LLAMA_SIGKILL_REAP_WAIT_SEC:-10}"
 
 # Extra stability guards for long WSL runs.
 # The low-VRAM guard arms only after the server passes its health check and
@@ -69,6 +83,30 @@ LLAMA_SPEC_DRAFT_N_MAX="${LLAMA_SPEC_DRAFT_N_MAX:-0}"
 # client. Must sit below 64000: choose_safe_ctx halves from 256000 and lands on
 # 64000, never 65536, so a 65536 threshold would silently skip safety mode.
 LLAMA_DISABLE_FA_CTX_THRESHOLD="${LLAMA_DISABLE_FA_CTX_THRESHOLD:-49152}"
+
+# Auto-restart supervision. When llama-server dies UNEXPECTEDLY (CUDA illegal
+# memory access, segfault, external kill) the supervisor relaunches it instead
+# of tearing the whole stack down — LiteLLM stays up so Claude Code keeps its
+# endpoint and just sees a short window of connection errors during reload.
+# A crash that trips a resource GUARD (OOM pressure, GPU overtemp, low VRAM) is
+# NOT auto-restarted by default: those mean the system is out of headroom, and
+# relaunching would march straight back into the same wall (overtemp especially
+# needs a real cooldown, not a 5s retry). Set LLAMA_RESTART_ON_GUARD_STOP=1 to opt in.
+LLAMA_RESTART_ENABLE="${LLAMA_RESTART_ENABLE:-1}"
+# Max consecutive failed generations before giving up. A generation that stays
+# healthy for LLAMA_HEALTHY_RESET_SEC resets this counter, so only a *rapid*
+# crash loop (e.g. a deterministic load-time crash) ever exhausts it.
+LLAMA_MAX_RESTARTS="${LLAMA_MAX_RESTARTS:-5}"
+# Backoff between restarts: base doubles each consecutive failure up to a cap.
+# The 5s base is deliberate — after a CUDA abort the driver/context needs a
+# moment to settle before a fresh process can allocate cleanly on WSL2.
+LLAMA_RESTART_BACKOFF_BASE_SEC="${LLAMA_RESTART_BACKOFF_BASE_SEC:-5}"
+LLAMA_RESTART_BACKOFF_MAX_SEC="${LLAMA_RESTART_BACKOFF_MAX_SEC:-60}"
+# A generation must run healthy at least this long to count as "recovered" and
+# clear the consecutive-failure counter.
+LLAMA_HEALTHY_RESET_SEC="${LLAMA_HEALTHY_RESET_SEC:-120}"
+# Opt-in: also restart after a resource-guard stop (see above — off by default).
+LLAMA_RESTART_ON_GUARD_STOP="${LLAMA_RESTART_ON_GUARD_STOP:-0}"
 
 # Persistent telemetry for post-mortem debugging after abrupt crashes/reboots.
 GUARD_LOG_ENABLE="${GUARD_LOG_ENABLE:-1}"
@@ -186,7 +224,7 @@ build_llama() {
     # 1-2GB+ RAM compiling CUDA kernels, which can OOM-kill the build.
     # ~2GB RAM per job is a safe rule of thumb.
     local TOTAL_RAM_GB
-    TOTAL_RAM_GB=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)
+    TOTAL_RAM_GB=$(awk '/^MemTotal:/ {printf "%d", $2/1024/1024; exit}' /proc/meminfo)
     local BUILD_JOBS=$(( TOTAL_RAM_GB / 2 ))
     [ "$BUILD_JOBS" -lt 1 ] && BUILD_JOBS=1
     echo "==> Building with -j$BUILD_JOBS (detected ${TOTAL_RAM_GB}GB RAM)..."
@@ -259,9 +297,9 @@ choose_safe_ctx() {
     local min_ctx="$LLAMA_CTX_MIN"
 
     local mem_total_kb mem_avail_kb swap_free_kb usable_kb reserve_kb
-    mem_total_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-    mem_avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
-    swap_free_kb=$(awk '/SwapFree/ {print $2}' /proc/meminfo)
+    mem_total_kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)
+    mem_avail_kb=$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)
+    swap_free_kb=$(awk '/^SwapFree:/ {print $2; exit}' /proc/meminfo)
     reserve_kb=$(( OOM_RESERVED_GB * 1024 * 1024 ))
 
     # Use currently available memory + free swap, minus a safety reserve.
@@ -392,26 +430,57 @@ if [ "${#HF_EXTRA_ARGS[@]}" -gt 0 ]; then
     LLAMA_ARGS+=("${HF_EXTRA_ARGS[@]}")
 fi
 
-# setsid detaches this into its own session so a second Ctrl+C at the
-# terminal doesn't land on llama-server directly. If a raw SIGINT hits it
-# mid-CUDA-teardown, the driver cleanup can be left half-done, which on
-# WSL2 can wedge the GPU passthrough (/dev/dxg) until `wsl --shutdown` —
-# the script's trap below is the only thing that should ever signal it.
-mkdir -p "$(dirname "$LLAMA_LOG_FILE")"
-[ -f "$LLAMA_LOG_FILE" ] && mv -f "$LLAMA_LOG_FILE" "$LLAMA_LOG_FILE.prev"
-echo "==> llama-server output is captured in $LLAMA_LOG_FILE"
-setsid "$LLAMA_DIR/llama-server" "${LLAMA_ARGS[@]}" >"$LLAMA_LOG_FILE" 2>&1 &
-
 LLAMA_PID=""
 MONITOR_PID=""
 LITELLM_PID=""
 LOGTAIL_PID=""
 
+# launch_llama_server <generation>
+# setsid detaches this into its own session so a second Ctrl+C at the
+# terminal doesn't land on llama-server directly. If a raw SIGINT hits it
+# mid-CUDA-teardown, the driver cleanup can be left half-done, which on
+# WSL2 can wedge the GPU passthrough (/dev/dxg) until `wsl --shutdown` —
+# the script's trap below is the only thing that should ever signal it.
+# Generation 1 uses the freshly-rotated log; restarts APPEND under a banner so
+# a full crash-and-recovery sequence stays in one file for post-mortem reading
+# (the .prev rotation already happened once, before the tail mirror attached).
+launch_llama_server() {
+    local generation="$1"
+    if [ "$generation" -gt 1 ]; then
+        {
+            echo ""
+            echo "===================================================================="
+            echo "==> RESTART generation=$generation at $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "===================================================================="
+        } >>"$LLAMA_LOG_FILE"
+        setsid "$LLAMA_DIR/llama-server" "${LLAMA_ARGS[@]}" >>"$LLAMA_LOG_FILE" 2>&1 &
+    else
+        setsid "$LLAMA_DIR/llama-server" "${LLAMA_ARGS[@]}" >"$LLAMA_LOG_FILE" 2>&1 &
+    fi
+
+    # setsid forks internally on some systems, so $! can point to a short-lived
+    # wrapper instead of the real process — find the actual PID by its command
+    # line so kill/kill -0 always target the real llama-server.
+    LLAMA_PID=""
+    local _
+    for _ in $(seq 1 100); do
+        LLAMA_PID=$(pgrep -f "$LLAMA_MATCH" | head -1 || true)
+        [ -n "$LLAMA_PID" ] && break
+        sleep 0.1
+    done
+    [ -n "$LLAMA_PID" ]
+}
+
+mkdir -p "$(dirname "$LLAMA_LOG_FILE")"
+[ -f "$LLAMA_LOG_FILE" ] && mv -f "$LLAMA_LOG_FILE" "$LLAMA_LOG_FILE.prev"
+echo "==> llama-server output is captured in $LLAMA_LOG_FILE"
+
 # Mirror the captured log to this terminal (see LLAMA_LOG_TO_CONSOLE above).
 # -F (not -f) so it tolerates the .prev rotation and the file not existing yet;
-# -n 0 starts from the launch we just kicked off (no stale replay). cleanup()
-# kills it on exit so it can't outlive the server. It only reads the file, so a
-# Ctrl+C on this tail can never reach llama-server's stdout.
+# -n 0 starts from the launch we're about to kick off (no stale replay), and it
+# survives restarts because it follows the path, not a PID. cleanup() kills it
+# on exit so it can't outlive the server. It only reads the file, so a Ctrl+C on
+# this tail can never reach llama-server's stdout.
 if [ "$LLAMA_LOG_TO_CONSOLE" = "1" ]; then
     echo "==> Mirroring llama-server log to this console (set LLAMA_LOG_TO_CONSOLE=0 to disable)."
     tail -n 0 -F "$LLAMA_LOG_FILE" 2>/dev/null &
@@ -419,6 +488,9 @@ if [ "$LLAMA_LOG_TO_CONSOLE" = "1" ]; then
 fi
 
 cleanup() {
+    # Capture the status that triggered this trap BEFORE anything else runs,
+    # so a supervisor-chosen exit code (e.g. give-up-after-restarts) survives.
+    local exit_code=$?
     # Run only once even though EXIT/INT/TERM can all fire this trap.
     trap - EXIT INT TERM
     echo "==> Shutting down..."
@@ -443,35 +515,69 @@ cleanup() {
     # Ctrl+C in that window doesn't leave it orphaned with nothing to kill it.
     local target="$LLAMA_PID"
     [ -z "$target" ] && target=$(pgrep -f "$LLAMA_MATCH" | head -1 || true)
-    [ -z "$target" ] && return
-    kill -0 "$target" 2>/dev/null || return
-    # Send exactly one SIGTERM and let llama-server unload the model and
-    # free GPU memory on its own — for a 35B model this can genuinely take
-    # a while, so we wait it out rather than escalating quickly.
-    kill "$target" 2>/dev/null || true
-    echo "==> Waiting for llama-server to release GPU memory (large models can take a minute)..."
-    local waited=0
-    while kill -0 "$target" 2>/dev/null; do
-        sleep 1
-        waited=$((waited + 1))
-        if [ $((waited % 10)) -eq 0 ]; then
-            echo "==> Still shutting down (${waited}s)... this is normal, no need to press Ctrl+C again."
+    if [ -n "$target" ] && kill -0 "$target" 2>/dev/null; then
+        # Graceful teardown lets llama-server free GPU memory on its own (a 35B
+        # model can take a while), then terminate_llama_pid escalates to SIGKILL
+        # and CONFIRMS the reap — so this can no longer poll a wedged process
+        # forever the way the original open-coded loop could.
+        # If a guard already diagnosed a wedge, skip the graceful grace entirely:
+        # waiting on a SIGTERM a wedged process can't service is pure dead time.
+        local cleanup_grace="$LLAMA_SHUTDOWN_GRACE_SEC"
+        case "$GUARD_EXIT_REASON" in
+            *wedged*) cleanup_grace=1 ;;
+            *) echo "==> Waiting for llama-server to release GPU memory (large models can take a minute)..." ;;
+        esac
+        if ! terminate_llama_pid "$target" "$cleanup_grace"; then
+            echo "==> llama-server did not die even after SIGKILL — WSL2's GPU passthrough is wedged."
+            echo "==> Run 'wsl.exe --shutdown' from PowerShell (not a full reboot) before starting again."
+            log_guard "cleanup_sigkill_unreaped pid=$target"
         fi
-        if [ "$waited" -ge "$LLAMA_SHUTDOWN_GRACE_SEC" ]; then
-            echo "==> llama-server did not exit after ${LLAMA_SHUTDOWN_GRACE_SEC}s — forcing termination."
-            echo "==> If the next run hangs while loading the model, this can leave WSL2's GPU passthrough wedged;"
-            echo "==> run 'wsl.exe --shutdown' from PowerShell (not a full reboot) and try again."
-            log_guard "cleanup_force_kill waited_s=$LLAMA_SHUTDOWN_GRACE_SEC pid=$target"
-            kill -9 "$target" 2>/dev/null || true
-            break
-        fi
-    done
+    fi
 
     rm -f "$READY_FLAG_FILE" "$GUARD_REASON_FILE"
     remove_guard_state
     log_guard "cleanup done reason=$GUARD_EXIT_REASON"
+    exit "$exit_code"
 }
 trap cleanup EXIT INT TERM
+
+# Terminate a llama-server PID with escalation, and CONFIRM it actually died.
+#   terminate_llama_pid <pid> [grace_sec]
+# One SIGTERM, wait up to grace_sec, then SIGKILL — then wait up to
+# LLAMA_SIGKILL_REAP_WAIT_SEC for the kernel to actually reap it.
+# Returns 0 if the process is gone, 1 if it survived even SIGKILL (wedged in an
+# uninterruptible GPU ioctl — the WSL2 /dev/dxg stall, only clearable by
+# `wsl.exe --shutdown`). Both the guard branches (watchdog SUBSHELL) and
+# cleanup() use this: the guards can't lean on cleanup()'s escalation because the
+# supervisor can't exit until the backend is dead, and the OLD code just polled
+# `kill -0` forever after a bare SIGTERM — which is the reported hang, where
+# llama-server printed "cleaning up before exit..." and then never returned.
+terminate_llama_pid() {
+    local pid="$1" grace="${2:-$LLAMA_SHUTDOWN_GRACE_SEC}" waited=0
+    kill -0 "$pid" 2>/dev/null || return 0
+    kill "$pid" 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+        waited=$((waited + 1))
+        [ "$waited" -ge "$grace" ] && break
+    done
+    kill -0 "$pid" 2>/dev/null || return 0
+
+    # Graceful window elapsed and it's still alive — force it.
+    log_guard "force_kill grace_s=$grace pid=$pid"
+    kill -9 "$pid" 2>/dev/null || true
+    waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+        waited=$((waited + 1))
+        if [ "$waited" -ge "$LLAMA_SIGKILL_REAP_WAIT_SEC" ]; then
+            # SIGKILL couldn't reap it inside the window: uninterruptible sleep.
+            log_guard "sigkill_unreaped pid=$pid wait_s=$LLAMA_SIGKILL_REAP_WAIT_SEC"
+            return 1
+        fi
+    done
+    return 0
+}
 
 runtime_watchdog() {
     local target_pid="$1"
@@ -486,12 +592,16 @@ runtime_watchdog() {
 
     while kill -0 "$target_pid" 2>/dev/null; do
         local mem_avail_kb swap_free_kb free_kb rss_kb dirty_kb writeback_kb
-        mem_avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
-        swap_free_kb=$(awk '/SwapFree/ {print $2}' /proc/meminfo)
-        dirty_kb=$(awk '/Dirty/ {print $2}' /proc/meminfo)
-        writeback_kb=$(awk '/Writeback/ {print $2}' /proc/meminfo)
+        # Anchor field names: an unanchored /Writeback/ also matches
+        # "WritebackTmp:", yielding a two-line value that breaks the numeric
+        # tests below (line "[: 0\n0: integer expression expected"). exit after
+        # the first hit keeps each capture a single integer.
+        mem_avail_kb=$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)
+        swap_free_kb=$(awk '/^SwapFree:/ {print $2; exit}' /proc/meminfo)
+        dirty_kb=$(awk '/^Dirty:/ {print $2; exit}' /proc/meminfo)
+        writeback_kb=$(awk '/^Writeback:/ {print $2; exit}' /proc/meminfo)
         free_kb=$(( mem_avail_kb + swap_free_kb ))
-        rss_kb=$(awk '/VmRSS/ {print $2}' "/proc/$target_pid/status" 2>/dev/null || echo 0)
+        rss_kb=$(awk '/^VmRSS:/ {print $2; exit}' "/proc/$target_pid/status" 2>/dev/null || echo 0)
 
         heartbeat_countdown=$((heartbeat_countdown - interval))
         if [ "$heartbeat_countdown" -le 0 ]; then
@@ -518,12 +628,23 @@ runtime_watchdog() {
 
         if [ "$low_streak" -ge "$RUNTIME_LOW_STREAK_LIMIT" ]; then
             echo "==> Runtime guard: memory pressure stayed critical for $((low_streak * interval))s."
-            echo "==> Stopping llama-server gracefully to avoid crashing WSL."
+            echo "==> Stopping llama-server to avoid crashing WSL."
             report_runtime_stop "runtime-system-memory-pressure"
             log_guard "runtime_stop reason=runtime-system-memory-pressure free_gb=$(awk "BEGIN {printf \"%.2f\", $free_kb/1024/1024}") rss_gb=$(awk "BEGIN {printf \"%.2f\", $rss_kb/1024/1024}")"
-            kill "$target_pid" 2>/dev/null || true
-            # Also end the parent script (and LiteLLM) so this failure is visible.
-            kill -TERM "$script_pid" 2>/dev/null || true
+            # Force-kill FAST here, not a graceful SIGTERM. Under memory pressure a
+            # graceful teardown is exactly the trap that hung the reported run:
+            # llama-server catches SIGTERM, prints "cleaning up before exit...",
+            # then tries to free ~25GB of --no-mmap weights while the box is
+            # already near-OOM — every page it touches faults through swap, so the
+            # teardown crawls or stalls. A SIGKILL lets the kernel reclaim the whole
+            # RSS at once, which is what actually relieves the pressure. The short
+            # grace still gives it a beat to drop the GPU context cleanly first.
+            terminate_llama_pid "$target_pid" "$LLAMA_GUARD_KILL_GRACE_SEC" \
+                || report_runtime_stop "runtime-system-memory-pressure-wedged"
+            # Leave the reason on disk and exit the watchdog only. The supervisor
+            # loop sees the watchdog exit, reads the reason, and (by default)
+            # treats a resource-guard stop as terminal — restarting straight into
+            # the same memory pressure would just crash WSL again.
             return
         fi
 
@@ -542,8 +663,8 @@ runtime_watchdog() {
                         echo "==> Stopping llama-server to prevent potential driver/system instability."
                         report_runtime_stop "runtime-gpu-overtemp"
                         log_guard "runtime_stop reason=runtime-gpu-overtemp gpu_temp_c=$gpu_temp gpu_free_mb=$gpu_mem_free"
-                        kill "$target_pid" 2>/dev/null || true
-                        kill -TERM "$script_pid" 2>/dev/null || true
+                        terminate_llama_pid "$target_pid" \
+                            || report_runtime_stop "runtime-gpu-overtemp-wedged"
                         return
                     fi
 
@@ -574,8 +695,8 @@ runtime_watchdog() {
                             echo "==> Stopping llama-server to avoid GPU driver reset/system crash."
                             report_runtime_stop "runtime-gpu-low-vram"
                             log_guard "runtime_stop reason=runtime-gpu-low-vram gpu_free_mb=$gpu_mem_free floor_mb=$gpu_free_floor_mb"
-                            kill "$target_pid" 2>/dev/null || true
-                            kill -TERM "$script_pid" 2>/dev/null || true
+                            terminate_llama_pid "$target_pid" \
+                                || report_runtime_stop "runtime-gpu-low-vram-wedged"
                             return
                         fi
                     fi
@@ -586,88 +707,296 @@ runtime_watchdog() {
         sleep "$interval"
     done
 
-    # Reaching here means llama-server vanished without the guard killing it
-    # — a crash (e.g. CUDA illegal memory access) or an external kill. Tear
-    # the script down too; otherwise LiteLLM keeps accepting requests and
-    # failing against a dead backend, which looks like a proxy problem.
-    echo "==> llama-server died unexpectedly — last lines of $LLAMA_LOG_FILE:"
-    tail -n 25 "$LLAMA_LOG_FILE" 2>/dev/null || true
-    report_runtime_stop "llama-server-died-unexpectedly"
-    log_guard "runtime_stop reason=llama-server-died-unexpectedly"
-    kill -TERM "$script_pid" 2>/dev/null || true
+    # Reaching here means llama-server vanished. Either a guard above already
+    # killed it (and recorded a reason via report_runtime_stop) or it crashed on
+    # its own (e.g. CUDA illegal memory access). We do NOT tear the script down
+    # here anymore — the supervisor loop notices the watchdog exit, reads the
+    # reason, and decides whether to auto-restart or stop. Only record a reason
+    # if a guard didn't already set one, so a guard-stop isn't misread as a crash.
+    if [ ! -s "$GUARD_REASON_FILE" ]; then
+        echo "==> llama-server died unexpectedly — last lines of $LLAMA_LOG_FILE:"
+        tail -n 25 "$LLAMA_LOG_FILE" 2>/dev/null || true
+        report_runtime_stop "llama-server-died-unexpectedly"
+        log_guard "runtime_stop reason=llama-server-died-unexpectedly"
+    fi
 }
 
-# setsid forks internally on some systems, so $! can point to a short-lived
-# wrapper instead of the real process — find the actual PID by its command
-# line so kill/kill -0 above always target the real llama-server.
-for _ in $(seq 1 100); do
-    LLAMA_PID=$(pgrep -f "$LLAMA_MATCH" | head -1 || true)
-    [ -n "$LLAMA_PID" ] && break
-    sleep 0.1
-done
-if [ -z "$LLAMA_PID" ]; then
-    echo "==> llama-server failed to start — last lines of $LLAMA_LOG_FILE:" >&2
-    tail -n 25 "$LLAMA_LOG_FILE" >&2 2>/dev/null || true
-    GUARD_EXIT_REASON="llama-server-start-failed"
-    log_guard "startup_failed reason=$GUARD_EXIT_REASON"
-    exit 1
-fi
-
-log_guard "startup_ok pid=$LLAMA_PID ctx=$LLAMA_CTX batch=$LLAMA_BATCH_SIZE ubatch=$LLAMA_UBATCH_SIZE"
-
-if [ "$RUNTIME_OOM_GUARD_ENABLE" = "1" ]; then
-    echo "==> Runtime OOM guard enabled (min free ${RUNTIME_MIN_FREE_GB}GB, check every ${RUNTIME_CHECK_INTERVAL_SEC}s)."
+# Spawn a fresh watchdog bound to the current LLAMA_PID. Called once per
+# generation: each restart gets a new llama-server PID, so the old watchdog
+# (which polls a now-dead PID) must be reaped first — the supervisor does that
+# before relaunching. Passing "$$" lets the watchdog log against this script.
+start_watchdog() {
+    [ "$RUNTIME_OOM_GUARD_ENABLE" = "1" ] || return 0
     runtime_watchdog "$LLAMA_PID" "$$" &
     MONITOR_PID="$!"
-fi
+}
 
+# Poll /health until the server answers or dies. Returns 0 when ready, 1 if
+# llama-server exited before it ever became healthy (a load-time crash — the
+# supervisor treats that specially so a deterministic startup crash can't spin
+# the restart loop forever).
 # llama-server's own download progress bar only prints when stdout is a tty,
 # so it silently disappears when backgrounded in some shells/IDEs. Poll the
 # partial download file on disk instead — this works everywhere. The curl
 # timeouts matter: without them a stuck connection attempt (e.g. WSL2
 # NAT hiccup) blocks this loop's condition check forever, which looks
 # identical to llama-server itself being hung.
-echo "==> Waiting for llama-server to be ready..."
-last_status=""
-elapsed=0
-next_heartbeat=15
-while ! curl -sf --connect-timeout 3 --max-time 5 "http://localhost:$LLAMA_PORT/health" >/dev/null 2>&1; do
-    if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
-        echo "==> llama-server exited unexpectedly — last lines of $LLAMA_LOG_FILE:" >&2
+wait_for_health() {
+    echo "==> Waiting for llama-server to be ready..."
+    local last_status="" elapsed=0 next_heartbeat=15 status dl_file
+    while ! curl -sf --connect-timeout 3 --max-time 5 "http://localhost:$LLAMA_PORT/health" >/dev/null 2>&1; do
+        if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
+            echo "==> llama-server exited before it became healthy — last lines of $LLAMA_LOG_FILE:" >&2
+            tail -n 25 "$LLAMA_LOG_FILE" >&2 2>/dev/null || true
+            return 1
+        fi
+
+        dl_file=$(find "$LLAMA_CACHE" -name '*.downloadInProgress' 2>/dev/null | head -1)
+        if [ -n "$dl_file" ]; then
+            status="Downloading model... $(du -h "$dl_file" 2>/dev/null | cut -f1)"
+        else
+            status="Loading..."
+        fi
+        if [ "$status" != "$last_status" ]; then
+            echo "==> $status"
+            last_status="$status"
+        elif [ "$elapsed" -ge "$next_heartbeat" ]; then
+            echo "==> Still $status (${elapsed}s elapsed — large models can take several minutes)"
+            next_heartbeat=$((next_heartbeat + 15))
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    echo "==> llama-server ready."
+    touch "$READY_FLAG_FILE"
+    return 0
+}
+
+start_litellm() {
+    echo "==> Starting LiteLLM proxy on port $PROXY_PORT..."
+    log_guard "litellm_start port=$PROXY_PORT"
+    "$VENV_DIR/bin/litellm" --config "$SCRIPT_DIR/litellm_config.yaml" --port "$PROXY_PORT" &
+    LITELLM_PID="$!"
+}
+
+# ---------------------------------------------------------------------------
+# Supervision loop.
+#
+# The original script launched llama-server exactly once, and the watchdog
+# tore the whole stack down the moment the backend vanished — so a mid-session
+# CUDA illegal-memory-access (llama.cpp #23210, the crash in the report) ended
+# the run and left Claude Code with no endpoint until a human re-ran start.sh.
+#
+# Now llama-server is supervised: an unexpected crash is relaunched in place
+# (LiteLLM keeps its port bound the whole time, so the endpoint just blips
+# during the reload instead of disappearing). Guard-initiated stops (OOM,
+# over-temp, low-VRAM) are treated as TERMINAL by default: restarting straight
+# back into the same resource wall would just crash again, possibly taking WSL
+# with it. Flip LLAMA_RESTART_ON_GUARD_STOP=1 to auto-restart those too.
+#
+# Deterministic crash protection: a run only "counts as healthy" (resetting the
+# failure streak) once it has served for LLAMA_HEALTHY_RESET_SEC. Faster crashes
+# accumulate, and after LLAMA_MAX_RESTARTS consecutive fast failures the
+# supervisor gives up rather than hammering a wedged GPU. Backoff grows
+# geometrically between attempts, giving the CUDA driver time to settle.
+# ---------------------------------------------------------------------------
+
+read_guard_reason() {
+    [ -f "$GUARD_REASON_FILE" ] && cat "$GUARD_REASON_FILE" 2>/dev/null || true
+}
+
+# Guard reasons that mean "the environment is unsafe right now" — restarting
+# into them is pointless (and risky) unless the operator opts in.
+is_terminal_guard_reason() {
+    case "$1" in
+        runtime-system-memory-pressure|runtime-gpu-overtemp|runtime-gpu-low-vram)
+            [ "$LLAMA_RESTART_ON_GUARD_STOP" = "1" ] && return 1 || return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Reap the current generation's watchdog before relaunching (or reading its
+# reason file). It polls a specific PID, so once that PID is dead it exits on
+# its own — but we wait on it so the reason it records is fully flushed to disk
+# before the supervisor reads it, and so a stale watchdog never lingers.
+reap_watchdog() {
+    [ -n "$MONITOR_PID" ] || return 0
+    kill -0 "$MONITOR_PID" 2>/dev/null && wait "$MONITOR_PID" 2>/dev/null || true
+    MONITOR_PID=""
+}
+
+# Sleep between restart attempts: base << (n-1), capped. Interruptible — a
+# Ctrl+C during the wait still lands the INT trap and shuts things down.
+restart_backoff() {
+    local n="$1" delay="$LLAMA_RESTART_BACKOFF_BASE_SEC" i=1
+    while [ "$i" -lt "$n" ]; do
+        delay=$(( delay * 2 ))
+        i=$(( i + 1 ))
+    done
+    [ "$delay" -gt "$LLAMA_RESTART_BACKOFF_MAX_SEC" ] && delay="$LLAMA_RESTART_BACKOFF_MAX_SEC"
+    echo "==> Waiting ${delay}s for the GPU/driver to settle before relaunching..."
+    log_guard "restart_backoff attempt=$n delay_s=$delay"
+    sleep "$delay"
+}
+
+# LLAMA_RESTART_ENABLE=0 restores the original single-shot behavior: cap the
+# budget at one generation so any failure falls straight through to the exit.
+if [ "$LLAMA_RESTART_ENABLE" != "1" ]; then
+    LLAMA_MAX_RESTARTS=1
+fi
+
+generation=0
+consecutive_failures=0
+supervise_exit_code=0
+
+while true; do
+    generation=$((generation + 1))
+    echo "==> Starting llama-server on port $LLAMA_PORT (generation $generation)..."
+    rm -f "$READY_FLAG_FILE" "$GUARD_REASON_FILE"
+
+    if ! launch_llama_server "$generation"; then
+        echo "==> llama-server failed to spawn — last lines of $LLAMA_LOG_FILE:" >&2
         tail -n 25 "$LLAMA_LOG_FILE" >&2 2>/dev/null || true
-        GUARD_EXIT_REASON="llama-server-exited-before-health"
-        log_guard "startup_failed reason=$GUARD_EXIT_REASON"
-        exit 1
+        GUARD_EXIT_REASON="llama-server-spawn-failed"
+        log_guard "spawn_failed generation=$generation reason=$GUARD_EXIT_REASON"
+        consecutive_failures=$((consecutive_failures + 1))
+        if [ "$consecutive_failures" -ge "$LLAMA_MAX_RESTARTS" ]; then
+            supervise_exit_code=1
+            break
+        fi
+        restart_backoff "$consecutive_failures"
+        continue
     fi
 
-    dl_file=$(find "$LLAMA_CACHE" -name '*.downloadInProgress' 2>/dev/null | head -1)
-    if [ -n "$dl_file" ]; then
-        status="Downloading model... $(du -h "$dl_file" 2>/dev/null | cut -f1)"
-    else
-        status="Loading..."
+    log_guard "startup_ok generation=$generation pid=$LLAMA_PID ctx=$LLAMA_CTX batch=$LLAMA_BATCH_SIZE ubatch=$LLAMA_UBATCH_SIZE"
+    [ "$generation" -eq 1 ] && [ "$RUNTIME_OOM_GUARD_ENABLE" = "1" ] \
+        && echo "==> Runtime OOM guard enabled (min free ${RUNTIME_MIN_FREE_GB}GB, check every ${RUNTIME_CHECK_INTERVAL_SEC}s)."
+    start_watchdog
+
+    if ! wait_for_health; then
+        # Died during load — never became healthy. This is the deterministic
+        # startup-crash case; count it and let the streak logic cap retries.
+        reap_watchdog
+        reason=$(read_guard_reason)
+        [ -z "$reason" ] && reason="llama-server-exited-before-health"
+        GUARD_EXIT_REASON="$reason"
+        log_guard "health_failed generation=$generation reason=$reason"
+        if is_terminal_guard_reason "$reason"; then
+            echo "==> Guard stop before ready ($reason) — not restarting. Set LLAMA_RESTART_ON_GUARD_STOP=1 to override."
+            supervise_exit_code=1
+            break
+        fi
+        consecutive_failures=$((consecutive_failures + 1))
+        if [ "$consecutive_failures" -ge "$LLAMA_MAX_RESTARTS" ]; then
+            echo "==> llama-server crashed during load $consecutive_failures times in a row — giving up." >&2
+            echo "==> This usually means a deterministic startup failure (bad args, corrupt model, wedged GPU)." >&2
+            echo "==> On WSL2 a wedged GPU passthrough often needs 'wsl.exe --shutdown' from PowerShell." >&2
+            supervise_exit_code=1
+            break
+        fi
+        restart_backoff "$consecutive_failures"
+        continue
     fi
-    if [ "$status" != "$last_status" ]; then
-        echo "==> $status"
-        last_status="$status"
-    elif [ "$elapsed" -ge "$next_heartbeat" ]; then
-        echo "==> Still $status (${elapsed}s elapsed — large models can take several minutes)"
-        next_heartbeat=$((next_heartbeat + 15))
+
+    log_guard "llama_ready generation=$generation health_ok=1"
+    ready_ts=$(date +%s)
+
+    # Start LiteLLM once, on the first healthy generation, and keep it up across
+    # llama-server restarts so Claude Code's endpoint never disappears.
+    if [ -z "$LITELLM_PID" ] || ! kill -0 "$LITELLM_PID" 2>/dev/null; then
+        start_litellm
     fi
-    sleep 2
-    elapsed=$((elapsed + 2))
+
+    # Watch both processes. Whichever dies first decides what happens next:
+    #   - LiteLLM gone      → operator Ctrl+C or proxy crash: shut everything down.
+    #   - llama-server gone → crash or guard stop: consult the reason and restart
+    #                         or give up. The short sleep keeps signal traps
+    #                         responsive (a foreground `wait` on the detached
+    #                         server isn't possible — it's not our child).
+    #   - watchdog gone but backend STILL alive → the guard fired, ran
+    #     terminate_llama_pid to completion (SIGTERM→grace→SIGKILL) and STILL
+    #     couldn't reap it: the backend is wedged in an uninterruptible GPU ioctl
+    #     (WSL2 /dev/dxg). Polling `kill -0` on it would loop forever — that was
+    #     the reported hang. Treat it as terminal and hand the operator the one
+    #     thing that clears a wedged passthrough: `wsl.exe --shutdown`.
+    backend_down=0
+    backend_wedged=0
+    while true; do
+        if [ -n "$LITELLM_PID" ] && ! kill -0 "$LITELLM_PID" 2>/dev/null; then
+            echo "==> LiteLLM proxy exited — shutting the stack down."
+            GUARD_EXIT_REASON="litellm-exited"
+            supervise_exit_code=0
+            break 2
+        fi
+        if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
+            backend_down=1
+            break
+        fi
+        if [ -n "$MONITOR_PID" ] && ! kill -0 "$MONITOR_PID" 2>/dev/null; then
+            backend_wedged=1
+            break
+        fi
+        sleep 2
+    done
+
+    if [ "$backend_wedged" -eq 1 ]; then
+        reap_watchdog
+        reason=$(read_guard_reason)
+        [ -z "$reason" ] && reason="llama-server-wedged-unkillable"
+        GUARD_EXIT_REASON="$reason"
+        echo "==> llama-server did not die even after SIGKILL ($reason) — its GPU passthrough is wedged." >&2
+        echo "==> This is the WSL2 /dev/dxg uninterruptible-sleep stall; a new process can't use the GPU" >&2
+        echo "==> until it clears. Run 'wsl.exe --shutdown' from PowerShell (not a full reboot), then rerun." >&2
+        log_guard "backend_wedged generation=$generation reason=$reason"
+        supervise_exit_code=1
+        break
+    fi
+
+    [ "$backend_down" -eq 1 ] || continue
+
+    # llama-server is gone. Reap the watchdog first so its reason file is fully
+    # written before we read it (it records the reason then exits).
+    reap_watchdog
+    reason=$(read_guard_reason)
+    [ -z "$reason" ] && reason="llama-server-died-unexpectedly"
+    GUARD_EXIT_REASON="$reason"
+    rm -f "$READY_FLAG_FILE" "$GUARD_REASON_FILE"
+
+    now=$(date +%s)
+    served=$(( now - ready_ts ))
+    log_guard "backend_down generation=$generation reason=$reason served_s=$served"
+
+    if is_terminal_guard_reason "$reason"; then
+        echo "==> Runtime guard stopped llama-server ($reason) after ${served}s — not restarting."
+        echo "==> Restarting into the same resource wall would likely crash again. Fix the pressure"
+        echo "==> (free RAM, cool the GPU) or set LLAMA_RESTART_ON_GUARD_STOP=1 to auto-retry anyway."
+        supervise_exit_code=1
+        break
+    fi
+
+    # A run that served long enough is considered stable — reset the streak so
+    # occasional crashes hours apart don't eventually exhaust the retry budget.
+    if [ "$served" -ge "$LLAMA_HEALTHY_RESET_SEC" ]; then
+        consecutive_failures=0
+    fi
+    consecutive_failures=$((consecutive_failures + 1))
+
+    echo "==> llama-server stopped after ${served}s (reason: $reason)."
+    if [ "$consecutive_failures" -ge "$LLAMA_MAX_RESTARTS" ]; then
+        echo "==> Reached $consecutive_failures consecutive failures without a stable run — giving up." >&2
+        echo "==> On WSL2 a wedged GPU passthrough often needs 'wsl.exe --shutdown' from PowerShell." >&2
+        supervise_exit_code=1
+        break
+    fi
+
+    echo "==> Auto-restarting llama-server (attempt $((consecutive_failures + 1)) of $LLAMA_MAX_RESTARTS; LiteLLM stays up)."
+    log_guard "auto_restart next_generation=$((generation + 1)) consecutive_failures=$consecutive_failures"
+    # Make sure no half-dead process still holds GPU memory before relaunching.
+    kill_stale_llama_server || true
+    restart_backoff "$consecutive_failures"
 done
-echo "==> llama-server ready."
-touch "$READY_FLAG_FILE"
-log_guard "llama_ready health_ok=1"
 
-echo "==> Starting LiteLLM proxy on port $PROXY_PORT..."
-log_guard "litellm_start port=$PROXY_PORT"
-# Background + wait instead of a foreground child: bash defers signal traps
-# until a foreground command finishes, so with LiteLLM in the foreground the
-# watchdog's TERM would sit undelivered while LiteLLM kept serving a dead
-# backend. wait is interruptible, so cleanup runs the moment a signal lands.
-"$VENV_DIR/bin/litellm" --config "$SCRIPT_DIR/litellm_config.yaml" --port "$PROXY_PORT" &
-LITELLM_PID="$!"
-wait "$LITELLM_PID" || true
-# LiteLLM ended (Ctrl+C, crash, or watchdog TERM) — the EXIT trap handles
-# shutting llama-server down.
+# Fell out of the supervision loop — the EXIT trap (cleanup) frees GPU memory,
+# stops LiteLLM and the watchdog, and propagates this code.
+log_guard "supervisor_exit code=$supervise_exit_code reason=$GUARD_EXIT_REASON"
+exit "$supervise_exit_code"
