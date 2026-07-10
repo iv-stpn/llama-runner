@@ -88,10 +88,13 @@ LLAMA_DISABLE_FA_CTX_THRESHOLD="${LLAMA_DISABLE_FA_CTX_THRESHOLD:-49152}"
 # memory access, segfault, external kill) the supervisor relaunches it instead
 # of tearing the whole stack down — LiteLLM stays up so Claude Code keeps its
 # endpoint and just sees a short window of connection errors during reload.
-# A crash that trips a resource GUARD (OOM pressure, GPU overtemp, low VRAM) is
-# NOT auto-restarted by default: those mean the system is out of headroom, and
-# relaunching would march straight back into the same wall (overtemp especially
-# needs a real cooldown, not a 5s retry). Set LLAMA_RESTART_ON_GUARD_STOP=1 to opt in.
+# A resource GUARD stop is restarted only when killing llama-server itself clears
+# the condition: memory-pressure and gpu-low-vram are SELF-CLEARING (llama IS the
+# ~24GB RSS / the VRAM tenant, so a fresh generation lands in a clean state) and
+# restart by default under the usual streak cap. GPU overtemp is NOT self-clearing
+# (the die needs real cooldown, not a 5s retry) and stays terminal unless
+# LLAMA_RESTART_ON_GUARD_STOP=1. A *-wedged passthrough is ALWAYS terminal (only
+# `wsl.exe --shutdown` clears it) regardless of that opt-in.
 LLAMA_RESTART_ENABLE="${LLAMA_RESTART_ENABLE:-1}"
 # Max consecutive failed generations before giving up. A generation that stays
 # healthy for LLAMA_HEALTHY_RESET_SEC resets this counter, so only a *rapid*
@@ -105,7 +108,9 @@ LLAMA_RESTART_BACKOFF_MAX_SEC="${LLAMA_RESTART_BACKOFF_MAX_SEC:-60}"
 # A generation must run healthy at least this long to count as "recovered" and
 # clear the consecutive-failure counter.
 LLAMA_HEALTHY_RESET_SEC="${LLAMA_HEALTHY_RESET_SEC:-120}"
-# Opt-in: also restart after a resource-guard stop (see above — off by default).
+# Opt-in: also restart after a GPU-overtemp stop (the only remaining terminal-by-
+# default guard; memory-pressure and low-VRAM already restart). *-wedged ignores
+# this — a stuck passthrough can't be retried away.
 LLAMA_RESTART_ON_GUARD_STOP="${LLAMA_RESTART_ON_GUARD_STOP:-0}"
 
 # Persistent telemetry for post-mortem debugging after abrupt crashes/reboots.
@@ -583,7 +588,8 @@ runtime_watchdog() {
     local target_pid="$1"
     local script_pid="$2"
     local interval="$RUNTIME_CHECK_INTERVAL_SEC"
-    local free_floor_kb=$(( RUNTIME_MIN_FREE_GB * 1024 * 1024 ))
+    # Armed post-ready with an adaptive baseline (see below) — NOT a fixed floor.
+    local free_floor_kb=""
     local low_streak=0
     local warned_writeback=0
     local gpu_low_streak=0
@@ -609,17 +615,38 @@ runtime_watchdog() {
             heartbeat_countdown="$GUARD_HEARTBEAT_SEC"
         fi
 
-        if [ "$free_kb" -lt "$free_floor_kb" ]; then
+        # Arm the system-RAM guard only once the server is READY, and baseline it
+        # against the free RAM at that moment — do NOT use a fixed floor. On this
+        # rig a fully loaded model legitimately leaves the box near the floor
+        # (llama RSS ~24GB, ~1.9GB free is the healthy steady state), so a fixed
+        # 2GB floor kills a HEALTHY server the first time a big request transiently
+        # bumps RSS — which is exactly what happened (served 6215s, then one 64k
+        # request tipped it over for 10s and it got killed). This is the same fix
+        # the GPU VRAM guard already has. If steady-state free is already below
+        # 2×min, floor at half of it and only fire on a real further collapse.
+        if [ -z "$free_floor_kb" ] && [ -f "$READY_FLAG_FILE" ]; then
+            local min_floor_kb=$(( RUNTIME_MIN_FREE_GB * 1024 * 1024 ))
+            if [ "$free_kb" -lt $(( min_floor_kb * 2 )) ]; then
+                free_floor_kb=$(( free_kb / 2 ))
+            else
+                free_floor_kb="$min_floor_kb"
+            fi
+            log_guard "sys_mem_guard_armed baseline_free_kb=$free_kb floor_kb=$free_floor_kb"
+        fi
+
+        # Until armed (still loading), skip the low-memory logic entirely: free RAM
+        # legitimately collapses during load and firing then is a false positive.
+        if [ -n "$free_floor_kb" ] && [ "$free_kb" -lt "$free_floor_kb" ]; then
             low_streak=$((low_streak + 1))
             if [ "$low_streak" -eq 1 ]; then
-                echo "==> Runtime guard warning: low memory headroom (~$(awk "BEGIN {printf \"%.2f\", $free_kb/1024/1024}")GB free incl. swap, llama RSS ~$(awk "BEGIN {printf \"%.2f\", $rss_kb/1024/1024}")GB)."
+                echo "==> Runtime guard warning: free RAM dropped below the post-load baseline floor (~$(awk "BEGIN {printf \"%.2f\", $free_kb/1024/1024}")GB free incl. swap, floor ~$(awk "BEGIN {printf \"%.2f\", $free_floor_kb/1024/1024}")GB, llama RSS ~$(awk "BEGIN {printf \"%.2f\", $rss_kb/1024/1024}")GB)."
             fi
         else
             low_streak=0
             warned_writeback=0
         fi
 
-        if [ "$free_kb" -lt "$free_floor_kb" ] && [ "$writeback_kb" -gt $((RUNTIME_WRITEBACK_WARN_MB * 1024)) ] && [ "$warned_writeback" -eq 0 ]; then
+        if [ -n "$free_floor_kb" ] && [ "$free_kb" -lt "$free_floor_kb" ] && [ "$writeback_kb" -gt $((RUNTIME_WRITEBACK_WARN_MB * 1024)) ] && [ "$warned_writeback" -eq 0 ]; then
             echo "==> Runtime guard notice: high kernel writeback (~$(awk "BEGIN {printf \"%.0f\", $writeback_kb/1024}")MB, dirty ~$(awk "BEGIN {printf \"%.0f\", $dirty_kb/1024}")MB)."
             echo "==> This can indicate cache/writeback pressure rather than pure model allocation growth."
             log_guard "writeback_pressure writeback_mb=$(awk "BEGIN {printf \"%.0f\", $writeback_kb/1024}") dirty_mb=$(awk "BEGIN {printf \"%.0f\", $dirty_kb/1024}") free_gb=$(awk "BEGIN {printf \"%.2f\", $free_kb/1024/1024}")"
@@ -641,10 +668,10 @@ runtime_watchdog() {
             # grace still gives it a beat to drop the GPU context cleanly first.
             terminate_llama_pid "$target_pid" "$LLAMA_GUARD_KILL_GRACE_SEC" \
                 || report_runtime_stop "runtime-system-memory-pressure-wedged"
-            # Leave the reason on disk and exit the watchdog only. The supervisor
-            # loop sees the watchdog exit, reads the reason, and (by default)
-            # treats a resource-guard stop as terminal — restarting straight into
-            # the same memory pressure would just crash WSL again.
+            # Leave the reason on disk and exit the watchdog only. The SIGKILL just
+            # freed llama's ~24GB RSS, so the pressure is already gone — the
+            # supervisor reads this reason and restarts into a now-clean box (unless
+            # the kill wedged, which upgrades the reason to -wedged == terminal).
             return
         fi
 
@@ -789,10 +816,11 @@ start_litellm() {
 #
 # Now llama-server is supervised: an unexpected crash is relaunched in place
 # (LiteLLM keeps its port bound the whole time, so the endpoint just blips
-# during the reload instead of disappearing). Guard-initiated stops (OOM,
-# over-temp, low-VRAM) are treated as TERMINAL by default: restarting straight
-# back into the same resource wall would just crash again, possibly taking WSL
-# with it. Flip LLAMA_RESTART_ON_GUARD_STOP=1 to auto-restart those too.
+# during the reload instead of disappearing). Guard-initiated stops are handled
+# by whether killing llama-server clears the condition (see is_terminal_guard_reason):
+# memory-pressure and low-VRAM SELF-CLEAR (llama IS the scarce RSS/VRAM), so they
+# restart by default; over-temp needs real cooldown so it stays terminal unless
+# LLAMA_RESTART_ON_GUARD_STOP=1; a *-wedged passthrough is always terminal.
 #
 # Deterministic crash protection: a run only "counts as healthy" (resetting the
 # failure streak) once it has served for LLAMA_HEALTHY_RESET_SEC. Faster crashes
@@ -805,12 +833,24 @@ read_guard_reason() {
     [ -f "$GUARD_REASON_FILE" ] && cat "$GUARD_REASON_FILE" 2>/dev/null || true
 }
 
-# Guard reasons that mean "the environment is unsafe right now" — restarting
-# into them is pointless (and risky) unless the operator opts in.
+# Decide whether a guard stop is TERMINAL (give up) or recoverable (restart).
+# The distinction is whether killing llama-server itself removes the condition:
+#   - memory-pressure / gpu-low-vram: SELF-CLEARING. llama-server IS the ~24GB RSS
+#     and the VRAM tenant, so killing it frees exactly what was scarce — a fresh
+#     generation lands in a clean state. These now RESTART by default (with the
+#     usual streak cap + backoff, so a genuine runaway still gives up after
+#     LLAMA_MAX_RESTARTS instead of looping forever).
+#   - gpu-overtemp: NOT self-clearing. The die is hot; it needs wall-clock cooldown,
+#     not a 5s retry. Stays terminal unless the operator opts in.
+#   - *-wedged: ALWAYS terminal. The GPU passthrough is stuck in an uninterruptible
+#     ioctl; only `wsl.exe --shutdown` clears it, so retrying is futile and the
+#     opt-in must NOT override it.
 is_terminal_guard_reason() {
     case "$1" in
-        runtime-system-memory-pressure|runtime-gpu-overtemp|runtime-gpu-low-vram)
+        *-wedged) return 0 ;;
+        runtime-gpu-overtemp)
             [ "$LLAMA_RESTART_ON_GUARD_STOP" = "1" ] && return 1 || return 0 ;;
+        runtime-system-memory-pressure|runtime-gpu-low-vram) return 1 ;;
         *) return 1 ;;
     esac
 }
@@ -967,9 +1007,19 @@ while true; do
     log_guard "backend_down generation=$generation reason=$reason served_s=$served"
 
     if is_terminal_guard_reason "$reason"; then
-        echo "==> Runtime guard stopped llama-server ($reason) after ${served}s — not restarting."
-        echo "==> Restarting into the same resource wall would likely crash again. Fix the pressure"
-        echo "==> (free RAM, cool the GPU) or set LLAMA_RESTART_ON_GUARD_STOP=1 to auto-retry anyway."
+        case "$reason" in
+            *-wedged)
+                echo "==> Runtime guard stopped llama-server ($reason) after ${served}s — not restarting." >&2
+                echo "==> The GPU passthrough is wedged (unkillable ioctl); a fresh process can't use the GPU" >&2
+                echo "==> until it clears. Run 'wsl.exe --shutdown' from PowerShell, then rerun." >&2 ;;
+            runtime-gpu-overtemp)
+                echo "==> Runtime guard stopped llama-server (GPU over-temp) after ${served}s — not restarting." >&2
+                echo "==> The die needs real cooldown, not a quick retry. Let it cool (improve airflow/clocks)" >&2
+                echo "==> then rerun, or set LLAMA_RESTART_ON_GUARD_STOP=1 to auto-retry anyway." >&2 ;;
+            *)
+                echo "==> Runtime guard stopped llama-server ($reason) after ${served}s — not restarting." >&2
+                echo "==> Set LLAMA_RESTART_ON_GUARD_STOP=1 to auto-retry anyway." >&2 ;;
+        esac
         supervise_exit_code=1
         break
     fi
